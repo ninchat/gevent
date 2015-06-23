@@ -215,7 +215,7 @@ _watcher_types = ['ev_io',
                   'ev_fork',
                   'ev_async',
                   'ev_child',
-                  'ev_stat',]
+                  'ev_stat', ]
 
 _source = """   // passed to the real C compiler
 #define LIBEV_EMBED 1
@@ -232,6 +232,8 @@ _cbs = """
 static int (*python_callback)(void* handle, int revents);
 static void (*python_handle_error)(void* handle, int revents);
 static void (*python_stop)(void* handle);
+static int (*python_loop_check_callback)(void* handle);
+static void (*python_loop_check_error)(void* handle);
 """
 _cdef += _cbs
 _source += _cbs
@@ -244,15 +246,14 @@ for _watcher_type in _watcher_types:
         ...;
     };
     static void _gevent_%s_callback(struct ev_loop* loop, struct %s* watcher, int revents);
-    """ %(_watcher_type, _watcher_type, _watcher_type, _watcher_type)
+    """ % (_watcher_type, _watcher_type, _watcher_type, _watcher_type)
 
     _source += """
     struct gevent_%s {
         struct %s watcher;
         void* handle;
     };
-    """ %(_watcher_type, _watcher_type)
-
+    """ % (_watcher_type, _watcher_type)
 
     _source += """
     static void _gevent_%s_callback(struct ev_loop* loop, struct %s* watcher, int revents)
@@ -270,6 +271,26 @@ for _watcher_type in _watcher_types:
     }
     """ % (_watcher_type, _watcher_type, _watcher_type)
 
+# Setup the check callback
+_source += """
+static void _gevent_loop_check_callback(struct ev_loop* loop, struct gevent_ev_check* watcher, int revents)
+{
+    if( !ev_is_default_loop(loop) ) {
+        return;
+    }
+
+    void* handle = watcher->handle;
+
+    if( python_loop_check_callback(handle) != 42 ) {
+        python_loop_check_error(handle);
+    }
+
+}
+"""
+_cdef += """
+static void _gevent_loop_check_callback(struct ev_loop* loop, struct gevent_ev_check* watcher, int revents);
+"""
+
 thisdir = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [thisdir, os.path.join(thisdir, 'libev')]
 ffi.cdef(_cdef)
@@ -278,6 +299,7 @@ del thisdir, include_dirs, _watcher_type, _watcher_types
 
 libev.vfd_open = libev.vfd_get = lambda fd: fd
 libev.vfd_free = lambda fd: None
+
 
 @ffi.callback("int(void* handle, int revents)")
 def _python_callback(handle, revents):
@@ -297,6 +319,7 @@ libev.python_callback = _python_callback
 # that was the last reference to it, the handle would be GC'd.
 # Therefore the other functions need to correctly deal with an
 # invalid handle
+
 
 @ffi.callback("void(void* handle, int revents)")
 def _python_handle_error(handle, revents):
@@ -318,6 +341,7 @@ def _python_handle_error(handle, revents):
             return
 libev.python_handle_error = _python_handle_error
 
+
 @ffi.callback("void(void* handle)")
 def _python_stop(handle):
     try:
@@ -326,6 +350,25 @@ def _python_stop(handle):
         return
     watcher.stop()
 libev.python_stop = _python_stop
+
+
+@ffi.callback("int(void* handle)")
+def _python_loop_check_callback(handle):
+    # The sole purpose of this function is to be called from C;
+    # calling from C into Python implicitly checks the signal status
+    # and will cause this function to raise KeyboardInterrupt if needed.
+    # If not needed, the return value is returned.
+    # The KeyboardInterrupt is uncacheable and is printed to stderr
+    # by CFFI.
+    return 42
+libev.python_loop_check_callback = _python_loop_check_callback
+
+
+@ffi.callback("void(void* handle)")
+def _python_loop_check_error(handle):
+    loop = ffi.from_handle(handle)
+    loop.handle_error(loop, KeyboardInterrupt, KeyboardInterrupt(), None)
+libev.python_loop_check_error = _python_loop_check_error
 
 
 UNDEF = libev.EV_UNDEF
@@ -504,11 +547,14 @@ class loop(object):
     def __init__(self, flags=None, default=None):
         self._in_callback = False
         self._callbacks = []
-
+        self._handle = ffi.new_handle(self)
         # self._check is a watcher that runs in each iteration of the
-        # mainloop, just after the blocking call
-        self._check = ffi.new("struct ev_check *")
-        self._check_callback_ffi = ffi.callback("void(*)(struct ev_loop *, void*, int)", self._check_callback)
+        # mainloop, just after the blocking call. We use it to
+        # see if a signal needs to be handled
+        self._gcheck = ffi.new("struct gevent_ev_check *")
+        self._gcheck.handle = self._handle
+        self._check = ffi.cast('struct ev_check*', self._gcheck)
+        self._check_callback_ffi = libev._gevent_loop_check_callback
         libev.ev_check_init(self._check, self._check_callback_ffi)
 
         # self._prepare is a watcher that runs in each iteration of the mainloop,
@@ -544,21 +590,7 @@ class loop(object):
         libev.ev_check_start(self._ptr, self._check)
         self.unref()
 
-        if default:
-            signalmodule.signal(2, self.int_handler)
-        self.ate_keyboard_interrupt = False
-        self.keyboard_interrupt_allowed = True
         self._keepaliveset = set()
-
-    def _check_callback(self, *args):
-        if self.ate_keyboard_interrupt:
-            self.handle_error(self, KeyboardInterrupt, KeyboardInterrupt(), None)
-            self.ate_keyboard_interrupt = False
-
-    def int_handler(self, *args):
-        if self.keyboard_interrupt_allowed:
-            raise KeyboardInterrupt
-        self.ate_keyboard_interrupt = True
 
     def _run_callbacks(self, evloop, _, revents):
         count = 1000
@@ -576,12 +608,10 @@ class loop(object):
                 cb.callback = None
 
                 try:
-                    self.keyboard_interrupt_allowed = True
                     callback(*args)
                 except:
                     self.handle_error(cb, *sys.exc_info())
                 finally:
-                    self.keyboard_interrupt_allowed = False
                     # Note, this must be reset here, because cb.args is used as a flag in callback class,
                     cb.args = None
                     count -= 1
@@ -658,9 +688,7 @@ class loop(object):
         if once:
             flags |= libev.EVRUN_ONCE
 
-        self.keyboard_interrupt_allowed = False
         libev.ev_run(self._ptr, flags)
-        self.keyboard_interrupt_allowed = True
 
     def reinit(self):
         libev.ev_loop_fork(self._ptr)
