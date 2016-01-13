@@ -56,6 +56,31 @@ class TestSSL(test__socket.TestTCP):
                 client.close()
                 server_sock[0][0].close()
 
+        def test_ssl_sendall_timeout(self):
+            # Issue #719: SSLEOFError
+
+            data = b'HTTP/1.0\r\nGET /\r\nConnection: Keep-Alive\r\n\r\nHere is a body\r\n'
+            data += b'make the body longer\r\n' * 10000
+
+            def server_func():
+                remote, _ = self.listener.accept()
+                f = remote.makefile('rb')
+                try:
+                    d = f.read(len(data))
+                    self.assertEqual(d, data)
+                finally:
+                    f.close()
+                    remote.close()
+
+            acceptor = test__socket.Thread(target=server_func)
+            client = self.create_connection()
+            client.settimeout(0.001)
+            try:
+                client.sendall(data)
+            finally:
+                acceptor.join()
+                client.close()
+
 
 def ssl_listener(address, private_key, certificate):
     raw_listener = socket.socket()
