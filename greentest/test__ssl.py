@@ -10,7 +10,7 @@ import ssl
 
 
 class TestSSL(test__socket.TestTCP):
-
+    __timeout__ = 9000
     certfile = os.path.join(os.path.dirname(__file__), 'test_server.crt')
     privfile = os.path.join(os.path.dirname(__file__), 'test_server.key')
     # Python 2.x has socket.sslerror (which  is an alias for
@@ -22,11 +22,12 @@ class TestSSL(test__socket.TestTCP):
 
     def setUp(self):
         greentest.TestCase.setUp(self)
-        self.listener, _raw_listener = ssl_listener(('127.0.0.1', 0), self.privfile, self.certfile)
+        self.listener, self.raw_listener = ssl_listener(('127.0.0.1', 0), self.privfile, self.certfile)
         self.port = self.listener.getsockname()[1]
 
-    def create_connection(self):
-        return ssl.wrap_socket(super(TestSSL, self).create_connection())
+    def create_connection(self, port=None, timeout=None):
+        return self._close_on_teardown(
+            ssl.wrap_socket(super(TestSSL, self).create_connection(port=port, timeout=timeout)))
 
     if not sys.platform.startswith('win32'):
 
@@ -64,22 +65,74 @@ class TestSSL(test__socket.TestTCP):
 
             def server_func():
                 remote, _ = self.listener.accept()
-                f = remote.makefile('rb')
                 try:
-                    d = f.read(len(data))
-                    self.assertEqual(d, data)
+                    d = remote.recv(500)
+                    dd = d
+                    while d:
+                        d = remote.recv(5000)
+                        dd += d
+                    self.assertEqual(dd, data)
                 finally:
-                    f.close()
                     remote.close()
 
             acceptor = test__socket.Thread(target=server_func)
-            client = self.create_connection()
-            client.settimeout(0.001)
+            # set the timeout before wrapping the socket so that
+            # it applies to the handshake and everything
+            client = self.create_connection(timeout=0.1)
+            #client.settimeout(0.001)
             try:
-                client.sendall(data)
+                for _ in range(1):
+                    client.send(data)
+                    #print("sent", l, 'of', len(data))
+                    #import gevent
+                    #gevent.sleep(10)
             finally:
-                acceptor.join()
                 client.close()
+                acceptor.join()
+
+        def test_ssl_eof_on_handshake(self):
+            return
+            # Issue #719
+            self.listener.close()
+            self.port = -1
+            raw_listener = self._close_on_teardown(socket.socket())
+            greentest.bind_and_listen(raw_listener, ('127.0.0.1', 0))
+            port = raw_listener.getsockname()[1]
+
+            data = b'hi'
+
+            def server_func():
+                while True:
+                    #print("Accepting")
+                    remote, _ = raw_listener.accept()
+                    #print("Accepted", remote)
+                    remote = ssl.wrap_socket(remote, self.privfile, self.certfile, server_side=True)
+                    self._close_on_teardown(remote)
+                    #print("WRapped", remote)
+                    f = remote.makefile('rb')
+                    print("Reading")
+                    try:
+                        d = f.read(len(data))
+                        self.assertEqual(d, data)
+                    finally:
+                        f.close()
+                        remote.close()
+
+            acceptor = test__socket.Thread(target=server_func)
+            print("Connecting")
+            for _ in range(1000):
+                raw_client = self._close_on_teardown(super(TestSSL, self).create_connection(port=port))
+                raw_client.close()
+                continue
+                print("Connected")
+                try:
+                    print("Sending")
+                    client.sendall(data)
+                    print("Sent")
+                finally:
+                    client.close()
+            raw_listener.close()
+            acceptor.join()
 
 
 def ssl_listener(address, private_key, certificate):
