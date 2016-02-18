@@ -327,6 +327,8 @@ class SSLSocket(socket):
         self._checkClosed()
         if not self._sslobj:
             raise ValueError("Write on closed or unwrapped SSL socket.")
+        if len(data) == 0:
+            return 0
         while True:
             try:
                 return self._sslobj.write(data)
@@ -398,6 +400,8 @@ class SSLSocket(socket):
         if not self._sslobj:
             return socket.send(self, data, flags, timeout)
 
+        if len(data) == 0:
+            return 0
         while True:
             try:
                 return self._sslobj.write(data)

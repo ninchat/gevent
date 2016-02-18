@@ -253,6 +253,8 @@ class SSLSocket(socket):
         if not self._sslobj:
             raise ValueError("Write on closed or unwrapped SSL socket.")
 
+        if len(data) == 0:
+            return 0
         while True:
             try:
                 return self._sslobj.write(data)
@@ -332,6 +334,8 @@ class SSLSocket(socket):
                 raise ValueError(
                     "non-zero flags not allowed in calls to send() on %s" %
                     self.__class__)
+            if len(data) == 0:
+                return 0
             while True:
                 try:
                     return self._sslobj.write(data)

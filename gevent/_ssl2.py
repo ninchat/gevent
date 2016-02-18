@@ -135,6 +135,8 @@ class SSLSocket(socket):
     def write(self, data):
         """Write DATA to the underlying SSL channel.  Returns
         number of bytes of DATA actually transmitted."""
+        if len(data) == 0:
+            return 0
         while True:
             try:
                 return self._sslobj.write(data)
@@ -173,6 +175,8 @@ class SSLSocket(socket):
                 raise ValueError(
                     "non-zero flags not allowed in calls to send() on %s" %
                     self.__class__)
+            if len(data) == 0:
+                return 0
             while True:
                 try:
                     v = self._sslobj.write(data)
